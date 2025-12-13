@@ -14,7 +14,9 @@ import argparse
 import json
 import logging
 import random
+import subprocess
 from dataclasses import dataclass
+from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Any, Dict, List, Sequence
 
@@ -22,6 +24,11 @@ import cv2
 import librosa
 import moviepy.editor as mpy
 import numpy as np
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 BASE_DIR = Path(__file__).resolve().parent
 METADATA_DIR = BASE_DIR / "metadata"
@@ -55,6 +62,13 @@ FACE_CONFIG: Dict[str, Dict[str, Any]] = {
         "black_frame_prob": 0.1,
     },
 }
+
+
+def _progress(iterable, desc: str = ""):
+    """Wrap an iterable with a progress bar if tqdm is available."""
+    if tqdm is not None:
+        return tqdm(iterable, desc=desc)
+    return iterable
 
 
 @dataclass
@@ -290,7 +304,6 @@ def _maybe_add_black_frame(duration: float, resolution: tuple[int, int]) -> mpy.
 
     return mpy.ColorClip(size=resolution, color=(0, 0, 0)).set_duration(duration)
 
-
 def render_face_video(
     segments: Sequence[ClipSegment],
     audio_path: Path,
@@ -306,14 +319,19 @@ def render_face_video(
     black_frame_prob = float(face_logic.get("black_frame_prob", 0.0))
 
     clips: List[mpy.VideoClip] = []
+    # Keep track of original VideoFileClip objects so we can close them later
+    source_clips: List[mpy.VideoFileClip] = []
+
     for segment in segments:
         source_clip = mpy.VideoFileClip(str(segment.clip_path))
+        source_clips.append(source_clip)
+
         if source_clip.duration <= 0:
+            # skip empty/broken clips
             continue
 
         if random.random() < black_frame_prob:
             clips.append(_maybe_add_black_frame(segment.duration, source_clip.size))
-            source_clip.close()
             continue
 
         start_max = max(0.0, source_clip.duration - segment.duration)
@@ -349,10 +367,13 @@ def render_face_video(
         logger=None,
     )
 
+    # Clean up
     final.close()
     audio.close()
     for clip in clips:
         clip.close()
+    for sc in source_clips:
+        sc.close()
 
 
 def apply_triangle_mask(face_video_path: Path, mask_png_path: Path, output_path: Path) -> None:
@@ -379,12 +400,196 @@ def apply_triangle_mask(face_video_path: Path, mask_png_path: Path, output_path:
     video.close()
 
 
-def _load_face_clips(track: str, face_key: str, sample_every_sec: float) -> List[Dict[str, Any]]:
-    """Load metadata for clips belonging to a face."""
+# --------------------------------------------------------------------
+# Corruption detection + forced normalization for all clips (Option D)
+# --------------------------------------------------------------------
+def is_video_corrupt(path: Path) -> bool:
+    """Use ffprobe to heuristically detect obviously broken videos.
 
-    folder = BASE_DIR / "videos" / f"{track}_face{face_key}"
+    Returns True if the file appears corrupt or unreadable.
+    """
+
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=nb_frames",
+        "-of",
+        "default=nw=1:nk=1",
+        str(path),
+    ]
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except Exception as exc:  # e.g. ffprobe missing
+        logging.warning("ffprobe not available or failed for %s: %s", path, exc)
+        return False  # can't decide, don't block the file
+
+    if proc.returncode != 0:
+        logging.warning("ffprobe error for %s: %s", path, proc.stderr.strip())
+        return True
+
+    out = proc.stdout.strip()
+    if out in ("", "N/A", "0"):
+        logging.warning("ffprobe suspicious nb_frames for %s: %r", path, out)
+        return True
+
+    return False
+
+
+def normalize_video(input_path: Path, output_path: Path, target_fps: int = 25) -> Path:
+    """
+    FORCE re-encode a video to a safe, consistent encoding (Option D):
+
+    - Constant frame rate (target_fps)
+    - yuv420p pixel format
+    - libx264 video codec
+    - AAC audio
+    """
+
+    logging.info("Normalizing video (re-encode) %s -> %s", input_path, output_path)
+
+    encode_cmd = [
+        "ffmpeg",
+        "-y",
+        "-err_detect",
+        "ignore_err",
+        "-i",
+        str(input_path),
+        "-vf",
+        f"fps={target_fps},format=yuv420p",
+        "-c:v",
+        "libx264",
+        "-pix_fmt",
+        "yuv420p",
+        "-preset",
+        "medium",
+        "-crf",
+        "20",
+        "-c:a",
+        "aac",
+        "-movflags",
+        "+faststart",
+        str(output_path),
+    ]
+    subprocess.run(
+        encode_cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+    return output_path
+
+
+def _normalize_worker(args: tuple[Path, Path, int]) -> Dict[str, Any]:
+    """Worker used by multiprocessing to normalize a single clip."""
+    input_path, norm_folder, target_fps = args
+    out_path = norm_folder / input_path.name
+
+    if out_path.exists():
+        return {
+            "input": str(input_path),
+            "normalized": str(out_path),
+            "skipped": True,
+            "corrupt": False,
+        }
+
+    corrupt = is_video_corrupt(input_path)
+    if corrupt:
+        logging.warning("Video appears corrupt and will be normalized: %s", input_path)
+
+    normalized_path = normalize_video(input_path, out_path, target_fps=target_fps)
+
+    return {
+        "input": str(input_path),
+        "normalized": str(normalized_path),
+        "skipped": False,
+        "corrupt": corrupt,
+    }
+
+
+def normalize_folder(
+    src_folder: Path,
+    dst_folder: Path,
+    target_fps: int = 25,
+) -> List[Dict[str, Any]]:
+    """Normalize all .mp4 clips in a folder in parallel.
+
+    Returns a list of dicts describing each normalization result.
+    """
+    ensure_dir(dst_folder)
+
+    clip_paths = sorted(src_folder.glob("*.mp4"))
+    if not clip_paths:
+        logging.warning("No .mp4 files found to normalize in %s", src_folder)
+        return []
+
+    cpu = max(1, cpu_count() - 1)
+    logging.info(
+        "Normalizing %d clips from %s using %d workers",
+        len(clip_paths),
+        src_folder,
+        cpu,
+    )
+
+    tasks: List[tuple[Path, Path, int]] = [(p, dst_folder, target_fps) for p in clip_paths]
+    results: List[Dict[str, Any]] = []
+
+    with Pool(processes=cpu) as pool:
+        for res in _progress(
+            pool.imap_unordered(_normalize_worker, tasks),
+            desc=f"Normalizing {src_folder.name}",
+        ):
+            results.append(res)
+
+    # Summary
+    corrupted = sum(1 for r in results if r["corrupt"])
+    skipped = sum(1 for r in results if r["skipped"])
+    logging.info(
+        "Normalization summary for %s: %d total, %d suspected corrupt, %d skipped (already normalized)",
+        src_folder,
+        len(results),
+        corrupted,
+        skipped,
+    )
+
+    return results
+
+
+def _load_face_clips(track: str, face_key: str, sample_every_sec: float) -> List[Dict[str, Any]]:
+    """Load metadata for clips belonging to a face.
+
+    Pipeline (Option D):
+    - Use raw videos in videos/{track}_face{face_key}
+    - FORCE re-encode them into videos_normalized/{track}_face{face_key}
+    - Run analysis ONLY on normalized clips
+    """
+
+    raw_folder = BASE_DIR / "videos" / f"{track}_face{face_key}"
+    if not raw_folder.exists():
+        logging.warning("Raw video folder missing for face %s: %s", face_key, raw_folder)
+        return []
+
+    norm_folder = BASE_DIR / "videos_normalized" / f"{track}_face{face_key}"
+    ensure_dir(norm_folder)
+
+    # Parallel normalization with corruption detection + progress bar
+    normalize_folder(raw_folder, norm_folder, target_fps=25)
+
+    # Now analyze ONLY the normalized clips
     return _load_or_analyze_clips(
-        track, f"face{face_key}", folder, sample_every_sec=sample_every_sec
+        track,
+        f"face{face_key}",
+        norm_folder,
+        sample_every_sec=sample_every_sec,
     )
 
 
@@ -428,9 +633,7 @@ def main() -> None:
         if args.force_clips and meta_path.exists():
             meta_path.unlink()
 
-        clips_meta = _load_or_analyze_clips(
-            track, f"face{face_key}", face_folder, sample_every_sec=args.sample_every
-        )
+        clips_meta = _load_face_clips(track, face_key, sample_every_sec=args.sample_every)
         if not clips_meta:
             logging.warning("No analyzed clips for face %s", face_key)
             continue
