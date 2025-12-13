@@ -279,7 +279,9 @@ def generate_face_video(
 
     ensure_dir(out_path.parent)
     # mugen uses MoviePy under the hood; write_to_video_file accepts typical kwargs
-    music_video.write_to_video_file(str(out_path))
+    # Force an explicit fps so downstream players and mugen's MoviePy writer
+    # do not infer mismatched values from source clips.
+    music_video.write_to_video_file(str(out_path), fps=fps)
 
 
     # optionally, you can save the pickle for later tweaks:
